@@ -338,8 +338,6 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const serverConfig = yield* ServerConfig.ServerConfig;
   const driver = OPENCODE_PROVIDER;
-  // Context windows by `provider/model`, from the latest `/api/model` read.
-  const contextWindows = new Map<string, number>();
 
   const openSession = Effect.fn("OpenCode2Adapter.openSession")(function* (
     input: Parameters<ProviderAdapter.ProviderAdapterV2Shape["openSession"]>[0],
@@ -347,6 +345,14 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
   ) {
     const { client } = connection;
     const sessionScope = yield* Effect.scope;
+    // Context windows by directory, then `provider/model`: a project's own
+    // OpenCode config can change a model's limits, and this one runtime serves
+    // the instance's threads in every directory.
+    const contextWindows = new Map<string, Map<string, number>>();
+    /** A thread without a worktree runs where T3 does, as its session is created. */
+    const directoryOf = (cwd: string | null | undefined) => cwd ?? serverConfig.cwd;
+    const windowOf = (cwd: string | null | undefined, model: string) =>
+      contextWindows.get(directoryOf(cwd))?.get(model);
     const now = yield* DateTime.now;
     let session: OrchestrationV2ProviderSession = {
       id: input.providerSessionId,
@@ -573,7 +579,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           terminal.status === "completed" ? "completed" : "interrupted",
         );
       }
-      const window = contextWindows.get(turn.input.modelSelection.model);
+      const window = windowOf(turn.input.runtimePolicy.cwd, turn.input.modelSelection.model);
       const lastStep = turn.lastStep;
       yield* emitProviderTurn(state, turn, {
         ...turn.providerTurn,
@@ -627,7 +633,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       );
       // A spawned server lists its models lazily, so a window still unknown is
       // read again for the next turn, off this stream so it never delays one.
-      if (window === undefined) yield* Effect.forkIn(readModels, sessionScope);
+      if (window === undefined) {
+        yield* Effect.forkIn(readModels(directoryOf(turn.input.runtimePolicy.cwd)), sessionScope);
+      }
     });
 
     /**
@@ -847,26 +855,33 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       );
     }
 
-    // Context windows come from the server's model list, read when the session
-    // opens and again after a turn whose model had none yet.
-    const readModels = client.model
-      .list({ location: { directory: session.cwd ?? serverConfig.cwd } })
-      .pipe(
-        Effect.timeout("5 seconds"),
-        Effect.tap((models) =>
-          Effect.sync(() => {
-            for (const model of models.data) {
-              // A model's input limit, when it has one, is its real headroom.
-              contextWindows.set(
-                `${model.providerID}/${model.id}`,
-                model.limit.input ?? model.limit.context,
-              );
-            }
-          }),
-        ),
-        Effect.ignore({ log: true }),
-      );
-    yield* readModels;
+    // Context windows come from the server's model list for a directory, read
+    // when the session opens, before a thread first runs in another directory,
+    // and again after a turn whose model had none yet. A directory counts as
+    // known once its read starts, so a failed read is retried only after a turn.
+    const readModels = (directory: string) =>
+      Effect.suspend(() => {
+        const windows = contextWindows.get(directory) ?? new Map<string, number>();
+        contextWindows.set(directory, windows);
+        return client.model.list({ location: { directory } }).pipe(
+          Effect.timeout("5 seconds"),
+          Effect.tap((models) =>
+            Effect.sync(() => {
+              for (const model of models.data) {
+                // A model's input limit, when it has one, is its real headroom.
+                windows.set(
+                  `${model.providerID}/${model.id}`,
+                  model.limit.input ?? model.limit.context,
+                );
+              }
+            }),
+          ),
+          Effect.ignore({ log: true }),
+        );
+      });
+    const readModelsOnce = (cwd: string | null | undefined) =>
+      contextWindows.has(directoryOf(cwd)) ? Effect.void : readModels(directoryOf(cwd));
+    yield* readModels(session.cwd);
 
     const register = (
       providerThread: OrchestrationV2ProviderThread,
@@ -910,8 +925,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         return session;
       },
       events: Stream.fromQueue(events),
-      getModelContextWindow: (selection) =>
-        selection.instanceId === instanceId ? contextWindows.get(selection.model) : undefined,
+      // A caller that names no directory gets the one this session opened in.
+      getModelContextWindow: (selection, cwd) =>
+        selection.instanceId === instanceId
+          ? windowOf(cwd === undefined ? session.cwd : cwd, selection.model)
+          : undefined,
       ensureThread: (threadInput) =>
         Effect.gen(function* () {
           if (threadInput.existingProviderThread?.nativeThreadRef != null) {
@@ -922,6 +940,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               runtimePolicy: threadInput.runtimePolicy,
             });
           }
+          yield* readModelsOnce(threadInput.runtimePolicy.cwd);
           const model = modelRef(threadInput.modelSelection);
           if (model === undefined) {
             return yield* new ProviderAdapter.ProviderAdapterProtocolError({
@@ -971,6 +990,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       resumeThread: (threadInput) =>
         Effect.gen(function* () {
           const sessionId = yield* sessionIdOf(threadInput.providerThread);
+          if (threadInput.runtimePolicy !== undefined) {
+            yield* readModelsOnce(threadInput.runtimePolicy.cwd);
+          }
           // 1.x session ids survive the upgrade; a server without this session
           // fails the resume, so T3 recreates the thread with a handoff.
           const native = yield* client.session.get({ sessionID: Session.ID.make(sessionId) });

@@ -116,6 +116,11 @@ const opening: ReadonlyArray<ProviderReplayEntry> = [
   out("model.list", "<any>"),
   reply("model.list", modelCatalog),
 ];
+/** The model list read the first time a thread runs in `directory`. */
+const directoryModels = (directory: string): ReadonlyArray<ProviderReplayEntry> => [
+  out("model.list", { "location[directory]": directory }),
+  reply("model.list", { ...modelCatalog, location: { directory } }),
+];
 
 const bigPickle: ModelSelection = { instanceId, model: "opencode/big-pickle" };
 const policy = (runtimeMode: "full-access" | "approval-required" = "full-access") => ({
@@ -667,6 +672,7 @@ describe("OpenCode2 adapter", () => {
     Effect.gen(function* () {
       const runtime = yield* openCode2ReplayRuntime([
         ...opening,
+        ...directoryModels("/work/opencode2-feature"),
         out("session.get", { sessionID: SESSION }),
         replyData("session.get", sessionInfo()),
         out("session.move", { sessionID: SESSION, directory: "/work/opencode2-feature" }),
@@ -687,6 +693,7 @@ describe("OpenCode2 adapter", () => {
       Effect.gen(function* () {
         const runtime = yield* openCode2ReplayRuntime([
           ...opening,
+          ...directoryModels("/work/opencode2-feature"),
           out("session.get", { sessionID: SESSION }),
           replyData("session.get", sessionInfo()),
           out("session.move", { sessionID: SESSION, directory: "/work/opencode2-feature" }),
@@ -978,6 +985,64 @@ describe("OpenCode2 adapter", () => {
     Effect.gen(function* () {
       const runtime = yield* openCode2ReplayRuntime([...opening]);
       assert.equal(runtime.getModelContextWindow?.(bigPickle), 160000);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("reports each directory's own limit for a model its project config changed", () =>
+    Effect.gen(function* () {
+      // 2.0.18 lists big-pickle at 48k input for a project whose opencode.json
+      // sets that limit, and at its catalog 160k everywhere else.
+      const custom = "/work/opencode2-custom";
+      const runtime = yield* openCode2ReplayRuntime([
+        ...opening,
+        out("model.list", { "location[directory]": custom }),
+        reply("model.list", {
+          location: { directory: custom },
+          data: modelCatalog.data.map((model) => ({
+            ...model,
+            limit: { context: 64000, input: 48000, output: 8000 },
+          })),
+        }),
+        out("session.create", {
+          location: { directory: custom },
+          model: { providerID: "opencode", id: "big-pickle" },
+          permissions: t3Rules,
+        }),
+        replyData("session.create", sessionInfo({ location: { directory: custom } })),
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.step.ended", {
+          sessionID: SESSION,
+          assistantMessageID: "msg_0eb735d5b001oAFVeY5jz3WD4Z",
+          finish: "stop",
+          cost: 0,
+          tokens: { input: 1200, output: 40, reasoning: 0, cache: { read: 0, write: 0 } },
+        }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+      ]);
+      const customPolicy = { ...policy(), cwd: custom };
+      const thread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection: bigPickle,
+        runtimePolicy: customPolicy,
+      });
+      // Each directory keeps its own limit, whichever was read last.
+      assert.equal(runtime.getModelContextWindow?.(bigPickle, WORK), 160000);
+      assert.equal(runtime.getModelContextWindow?.(bigPickle, custom), 48000);
+      const settled = yield* runtime.events.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.completedAt !== null,
+        ),
+        Stream.runHead,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn({ ...turnInput(thread), runtimePolicy: customPolicy });
+      const turn = Option.getOrUndefined(yield* Fiber.join(settled));
+      assert.equal(
+        turn?.type === "provider_turn.updated" ? turn.providerTurn.tokenUsage?.maxTokens : null,
+        48000,
+      );
     }).pipe(Effect.scoped),
   );
 });
